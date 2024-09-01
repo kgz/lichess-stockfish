@@ -1,10 +1,11 @@
 use core::str;
-use std::{fmt::format, process::exit, ptr::null, sync::Arc};
+use std::{process::exit, sync::Arc};
 
 use image::ImageReader;
 use serde::{Deserialize, Serialize};
-use serenity::{async_trait, futures::future::BoxFuture, model::channel, FutureExt};
 use tokio::sync::Mutex;
+
+use crate::models::error::Error;
 
 #[derive(Debug)]
 enum PieceType {
@@ -49,45 +50,62 @@ impl Color {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StockfishResponse {
     success: bool,
-    evaluation: f32,
+    evaluation: Option<f32>,
     mate: Option<i32>,
     bestmove: String,
     continuation: String,
 }
 
-#[derive(Debug)]
-struct Piece {
-    x: u8,
-    y: u8,
-    piece_type: PieceType,
-    color: Color,
+
+pub async fn get_html(url: String) -> Result<String, Error> {
+    let res = reqwest::get(url).await;
+
+	if res.is_err() {
+		return Err(Error::BasicError(format!("Error fetching html {:?}", res.err())));
+	}
+
+	let res = res.unwrap();
+
+	if res.status().as_u16() != 200 {
+		return Err(Error::BasicError(format!("Error fetching html {:?}", res.status())));
+	}
+
+	let body = res.text().await;
+
+	if body.is_err() {
+		return Err(Error::BasicError(format!("Error fetching html {:?}", body.err())));
+	}
+	
+
+	Ok(body.unwrap())
 }
 
-pub async fn get_html(url: String) -> Result<String, reqwest::Error> {
-    let res = reqwest::get(url).await?;
-    Ok(res.text().await?)
-}
-
-pub async fn get_stock_fish(url: Arc<Mutex<&str>>) -> Result<StockfishResponse, reqwest::Error> {
+pub async fn get_stock_fish(url: Arc<Mutex<&str>>) -> Result<StockfishResponse, Error> {
     let url = url.lock().await;
     let url = url.to_string();
     let res = reqwest::get(url).await.unwrap();
     let body = res.text().await.unwrap();
     let stockfish: Result<StockfishResponse, serde_json::Error> = serde_json::from_str(&body);
     if stockfish.is_err() {
-        println!("Error: {:?}", body);
+        println!("Error: {:?} {:?}", body, stockfish.err());
         exit(1); // todo lets not do this
     }
     Ok(stockfish.unwrap())
     // Ok(String::from("test"))
 }
 
-pub async fn parse_html<'a>(url: Arc<Mutex<&str>>, channel: Arc<Mutex<&str>>) -> ([[u8; 8]; 8], &'a str, Vec<(f32, f32)>) {
-	let url = url.lock().await;
-	let url = url.to_string();
-	let mut board = [[0u8; 8]; 8];
-	// set board at 3, 5 to 1
-	let html = get_html(url).await.unwrap();
+pub async fn parse_html<'a>(
+    url: Arc<Mutex<&str>>,
+    channel: Arc<Mutex<&str>>,
+) -> Result<([[u8; 8]; 8], &'a str, Vec<(f32, f32)>), Error> {
+    let url = url.lock().await;
+    let url = url.to_string();
+    let mut board = [[0u8; 8]; 8];
+    // set board at 3, 5 to 1
+    let html = get_html(url).await?;
+
+
+
     let dom = tl::parse(html.as_str(), tl::ParserOptions::default()).unwrap();
     // get title
     let title = dom.query_selector("title").and_then(|mut iter| iter.next());
@@ -108,7 +126,15 @@ pub async fn parse_html<'a>(url: Arc<Mutex<&str>>, channel: Arc<Mutex<&str>>) ->
         exit(1);
     }
 
-    let orientation_b = dom.get_elements_by_class_name("player").next().unwrap();
+    let orientation_b = dom.get_elements_by_class_name("player").next();
+
+    if orientation_b.is_none() {
+		return Err(Error::BasicError("Orientation not found".to_string()));
+    }
+	let orientation_b = orientation_b.unwrap();
+	
+
+
     // let orientation_w = dom.get_elements_by_class_name("orientation-black").next();
     let classes = orientation_b
         .get(dom.parser())
@@ -153,14 +179,15 @@ pub async fn parse_html<'a>(url: Arc<Mutex<&str>>, channel: Arc<Mutex<&str>>) ->
         last_moves_x_y_vec.push((x, y));
     }
 
-    let mode = match classes
-        .as_utf8_str()
-        .split_whitespace()
-        .any(|x| x == "white")
+	let nclasses = classes.as_utf8_str();
+	let nclasses = nclasses.split_whitespace().collect::<Vec<&str>>();
+	println!("classess: {:?}", nclasses.clone());
+	println!("has white: {:?}", nclasses.contains(&"white"));
+    let mode = match nclasses.contains(&"white")
     {
         // if white is first then it means our player is black
-        true => "b",
-        _ => "w",
+        true => "w",
+        false => "b",
     };
     // println!("Orientation W: {:?}", orientation_w);
     println!(
@@ -174,8 +201,7 @@ pub async fn parse_html<'a>(url: Arc<Mutex<&str>>, channel: Arc<Mutex<&str>>) ->
     let pieces = pieces.unwrap();
 
     if pieces.clone().count() == 0 {
-        println!("Not in an active game");
-        exit(1);
+		return Err(Error::BasicError("Not in an active game".to_string()));
     }
 
     for piece in pieces.clone().into_iter() {
@@ -271,24 +297,33 @@ pub async fn parse_html<'a>(url: Arc<Mutex<&str>>, channel: Arc<Mutex<&str>>) ->
         println!();
     }
 
-
-	(board, mode, last_moves_x_y_vec)
+    Ok((board, mode, last_moves_x_y_vec))
 }
 
-pub async fn help<'a>(channel: Arc<Mutex<&'a &str>>) -> std::string::String {
-    let channel = channel.lock().await;
-	let channel = channel.to_string();
-    let url = format!("https://lichess.org/@/{}/tv", channel.clone());
-	let url = Arc::new(Mutex::new(url.as_str()));
-	let channel = Arc::new(Mutex::new(channel.as_str()));
-    let res = parse_html(url, channel).await;
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GetStockFishResponse {
+    pub is_black: bool,
+    pub evaluation: f32,
+    pub mate: Option<i32>,
+    pub bestmove: String,
+    pub continuation: String,
+    pub file: String,
+}
 
-	let mut board = res.0;
-	let mode = res.1;
-	let last_moves_x_y_vec = res.2;
+pub async fn help<'a>(channel: Arc<Mutex<&'a &str>>) -> Result<GetStockFishResponse, Error> {
+    let channel = channel.lock().await;
+    let channel = channel.to_string();
+    let name = channel.clone();
+    let url = format!("https://lichess.org/@/{}/tv", channel.clone());
+    let url = Arc::new(Mutex::new(url.as_str()));
+    let channel = Arc::new(Mutex::new(channel.as_str()));
+    let res = parse_html(url, channel).await?;
+
+    let mut board = res.0;
+    let mode = res.1;
+    let last_moves_x_y_vec = res.2;
     // set board at 3, 5 to 1
 
-    
     // since we flip the board for stockfish we need to keep a copy of the original board
     let board_for_image = board.clone();
 
@@ -315,20 +350,25 @@ pub async fn help<'a>(channel: Arc<Mutex<&'a &str>>) -> std::string::String {
     println!("fetching stockfish evaluation...");
     let url = format!("https://stockfish.online/api/s/v2.php?fen={}&depth=15", fen);
     let url = Arc::new(Mutex::new(url.as_str()));
-    let stockfish = get_stock_fish(url).await.unwrap();
+    let stockfish = get_stock_fish(url).await?;
 
-
-	let bestmove = stockfish.bestmove.replace("bestmove ", "");
-    let ponder = bestmove.split_whitespace().nth(2).unwrap();
-    let bestmove = bestmove.split_whitespace().nth(0).unwrap();
-    let _eval = stockfish.evaluation;
-
-    let mut chance_to_win = (stockfish.evaluation) / 153.0;
-    if mode == "b" {
-        chance_to_win = 1.0 - chance_to_win;
-    }
-
-    let chance_to_win = (chance_to_win * 100.0) - 100.0;
+    let bestmove = stockfish.bestmove.replace("bestmove ", "");
+    let ponder = bestmove.split_whitespace().nth(2).unwrap_or_else(|| "None");
+    let bestmove = bestmove.split_whitespace().nth(0).unwrap_or_else(|| "None");
+    let _eval = match stockfish.evaluation {
+		Some(eval) => eval,
+		None => 0.0,
+	};
+	let mut chance_to_win;
+	if (stockfish.evaluation.is_some()) {
+		chance_to_win = (stockfish.evaluation.unwrap()) / 153.0;
+		if mode == "b" {
+			chance_to_win = 1.0 - chance_to_win;
+		}
+		chance_to_win = (chance_to_win * 100.0) - 100.0;
+	} else {
+		chance_to_win = 0.0;
+	}
 
     println!("Best Move: {:?}", bestmove);
     println!("Ponder: {:?}", ponder);
@@ -350,9 +390,19 @@ pub async fn help<'a>(channel: Arc<Mutex<&'a &str>>) -> std::string::String {
         mode,
         last_moves_x_y_vec,
         bestmove.to_string(),
+        name.to_string(),
     );
 
-    String::from(format!("./pics/{}.png", path))
+    let path = String::from(format!("{}.png", path));
+
+    Ok(GetStockFishResponse {
+        is_black: mode == "b",
+        evaluation: chance_to_win,
+        mate: stockfish.mate,
+        bestmove: bestmove.to_string(),
+        continuation: stockfish.continuation,
+        file: path,
+    })
 }
 
 pub fn gen_board(
@@ -360,6 +410,7 @@ pub fn gen_board(
     mode: &str,
     last_moves_x_y_vec: Vec<(f32, f32)>,
     best_move: String,
+    name: String,
 ) -> String {
     fn get_piece_path(piece_type: String) -> String {
         match piece_type.as_str() {
@@ -383,11 +434,14 @@ pub fn gen_board(
     let last_moved_img = "square brown dark_png_128px.png";
     let last_moved_img1 = "square brown light_png_128px.png";
 
-    let mut board =
-        image::open("./assets/JohnPablok Cburnett Chess set/PNGs/No shadow/128h/board.png")
-            .unwrap();
-    let mut count = 0;
 
+	// get project root
+	let cwd = std::env::current_dir().unwrap();
+    let mut board =
+        image::open(cwd.join("src/assets/board.png")).unwrap_or_else(|_| panic!("Error opening {:?}/assets/board.png", cwd.display()));
+	// /mnt/dev/lichess-stockfish/src/assets/board.png
+
+    let mut count = 0;
     for (x, y) in last_moves_x_y_vec {
         // x, y are percentages
         let x = x as f32 / 100.0;
@@ -406,17 +460,29 @@ pub fn gen_board(
         let last_moved;
         // in theory should never be more then 2
         if count % 2 == 0 {
-            last_moved = ImageReader::open(format!(
-                "./assets/JohnPablok Cburnett Chess set/PNGs/No shadow/128h/{}",
-                last_moved_img
-            ))
-            .unwrap();
+            // last_moved = ImageReader::open(format!(
+            //     "./assets/JohnPablok Cburnett Chess set/PNGs/No shadow/128h/{}",
+            //     last_moved_img
+            // ))
+            // .unwrap();
+
+			last_moved = ImageReader::open(cwd.join(format!(
+				"src/assets/JohnPablok Cburnett Chess set/PNGs/No shadow/128h/{}",
+				last_moved_img
+			)))
+			.unwrap_or_else(|_| panic!("Error opening {:?}/assets/JohnPablok Cburnett Chess set/PNGs/No shadow/128h/{}", cwd.display(), last_moved_img));
         } else {
-            last_moved = ImageReader::open(format!(
-                "./assets/JohnPablok Cburnett Chess set/PNGs/No shadow/128h/{}",
-                last_moved_img1
-            ))
-            .unwrap();
+            // last_moved = ImageReader::open(format!(
+            //     "./assets/JohnPablok Cburnett Chess set/PNGs/No shadow/128h/{}",
+            //     last_moved_img1
+            // ))
+            // .unwrap();
+
+			last_moved = ImageReader::open(cwd.join(format!(
+				"src/assets/JohnPablok Cburnett Chess set/PNGs/No shadow/128h/{}",
+				last_moved_img1
+			)))
+			.unwrap_or_else(|_| panic!("Error opening {:?}/assets/JohnPablok Cburnett Chess set/PNGs/No shadow/128h/{}", cwd.display(), last_moved_img1));
         }
         count += 1;
 
@@ -448,12 +514,12 @@ pub fn gen_board(
     // get the x, y of the best move
     let best_move = best_move.chars().collect::<Vec<char>>();
     let mut x = best_move[0] as u8 - 97;
-    let y = best_move[1] as u8 - 49;
+    let mut y = best_move[1] as u8 - 49;
 
     // if mode is 'b' then we need to revese the x
-    if mode == "b" {
+    if mode == "w" {
         x = 7 - x;
-        // y = 7 - y;
+        y = 7 - y;
     }
 
     let x = x as usize;
@@ -481,12 +547,12 @@ pub fn gen_board(
 
     // next position
     let mut x = best_move[2] as u8 - 97;
-    let y = best_move[3] as u8 - 49;
+    let mut y = best_move[3] as u8 - 49;
 
     // if mode is 'b' then we need to revese the x
-    if mode == "b" {
+    if mode == "w" {
         x = 7 - x;
-        // y = 7 - y;
+        y = 7 - y;
     }
 
     let x = x as usize;
@@ -532,11 +598,12 @@ pub fn gen_board(
     let mut board = board.to_rgba8();
 
     for (piece_name, x, y) in pieces {
-        let mut piece = ImageReader::open(format!(
-            "./assets/JohnPablok Cburnett Chess set/PNGs/No shadow/128h/{}",
-            piece_name
-        ))
-        .unwrap();
+		let mut piece = ImageReader::open(cwd.join(format!(
+			"src/assets/JohnPablok Cburnett Chess set/PNGs/No shadow/128h/{}",
+			piece_name
+		)))
+		.unwrap_or_else(|_| panic!("Error opening {:?}/assets/JohnPablok Cburnett Chess set/PNGs/No shadow/128h/{}", cwd.display(), piece_name));
+
         piece.set_format(image::ImageFormat::Png);
         let mut piece = piece.decode().unwrap();
 
@@ -576,12 +643,15 @@ pub fn gen_board(
     }
 
     // random name
-    let name = uuid::Uuid::new_v4().to_string();
-
+    // let name = channel; // uuid::Uuid::new_v4().to_string();
+    println!("Saving board to pics/{}.png", name);
     board
-        .save_with_format(format!("./pics/{}.png", name), image::ImageFormat::Png)
+        .save_with_format(format!("pics/{}.png", name), image::ImageFormat::Png)
         .unwrap();
 
+    // trim . from start
+    // let name = name.trim_start_matches(".").to_string();
+    println!("Name: {:?}", name);
     return name;
 }
 

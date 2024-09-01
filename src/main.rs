@@ -1,18 +1,15 @@
 use core::str;
 use std::sync::Arc;
-use std::{env, process::exit, vec};
+use std::env;
 
-use board::{encode_to_fen, gen_board, help};
+use board::help;
 use dotenv::dotenv;
-use image::{GenericImage, ImageReader};
-use serde::{Deserialize, Serialize};
 use serenity::all::standard::macros::hook;
 use serenity::all::{
-    ActivityData, Attachment, ChannelId, Context, CreateAttachment, CreateButton, CreateEmbed, CreateInteractionResponse, CreateMessage, EditAttachments, EditMessage, EventHandler, GatewayIntents, Interaction, Message, MessageBuilder
+    ChannelId, Context, CreateAttachment, CreateButton, CreateEmbed, CreateInteractionResponse, CreateMessage, EditMessage, EventHandler, GatewayIntents, Interaction, Message, MessageBuilder
 };
 use serenity::async_trait;
 use serenity::client::Client;
-use serenity::model::channel;
 use tokio::fs::File;
 use tokio::sync::Mutex;
 
@@ -20,6 +17,7 @@ mod board;
 mod schema;
 mod models {
     pub mod message;
+	pub mod error;
 }
 
 pub mod database {
@@ -39,126 +37,336 @@ impl EventHandler for Handler {
         }
 
         if args.len() == 2 && args[0] == "!help" {
-            let typing = msg.channel_id.broadcast_typing(&ctx.http).await.unwrap();
+            let _ = msg.channel_id.broadcast_typing(&ctx.http).await.unwrap();
             let channel = args[1];
             // to thread safe chennel
-            let og_channel = channel.clone();
+            let og_channel = channel;
             let channel = Arc::new(Mutex::new(&channel));
-            let image_path = help(channel).await;
-            println!("{}", image_path);
+
+			let mut description = MessageBuilder::new();
+
+			description.push_bold("Evaluation: ");
+			description.push_italic("Loading...");
+			description.push("\n");
+			
+			description.push_bold("Forced Mate?: ");
+			description.push_italic("Loading...");
+			description.push("\n");
+		
+			description.push_bold("Best Move: ");
+			description.push_italic("Loading...");
+			description.push("\n");
+			
+			let description = description.build();
+
+			let embed = CreateEmbed::default()
+				.title(og_channel.to_uppercase())
+				.description(description)
+				.image("https://dummyimage.com/1024x1024/2b2d31/ffffff.png&text=Fetching+Stockfish...")
+				;
+
+			let button = CreateButton::new("testButton")
+                .label("Refresh")
+                .style(serenity::all::ButtonStyle::Primary)
+                .custom_id("testButton")
+				.disabled(true)
+				;
+
+
+			let message = CreateMessage::new()
+				.embed(embed)
+                .button(button)
+
+				;
+
+                
+			let mut message = msg.channel_id.send_message(&ctx.http, message).await.unwrap();
+			let _  = crate::models::message::Message::insert(
+				crate::models::message::Message::new(og_channel.to_string(), message.id.to_string())
+			);
+			
+            let stock_resp = help(channel).await;
+
+			if stock_resp.is_err() {
+				println!("Error getting help {:?}", stock_resp.as_ref().err().unwrap().to_string());
+				// let _ = msg.channel_id.say(&ctx.http, format!("Error: {:?}", stock_resp.err())).await;
+				let mut description = MessageBuilder::new();
+
+				description.push_bold("Evaluation: ");
+				description.push_italic("N/A");
+				description.push("\n");
+				
+				description.push_bold("Forced Mate?: ");
+				description.push_italic("N/A");
+				description.push("\n");
+			
+				description.push_bold("Best Move: ");
+				description.push_italic("N/A");
+				description.push("\n");
+				description.push("\n");
+				description.push("\n");
+				description.push_quote(format!("Error getting help {:?}", stock_resp.err().unwrap().to_string()));
+				
+				let description = description.build();
+	
+				let embed = CreateEmbed::default()
+					.title(og_channel.to_uppercase())
+					.description(description)
+					;
+	
+				let button = CreateButton::new("testButton")
+					.label("Refresh")
+					.style(serenity::all::ButtonStyle::Danger)
+					.custom_id("testButton")
+					.disabled(true)
+					
+					;
+	
+	
+				let new_message = EditMessage::new()
+					.embed(embed)
+					.button(button)
+	
+					;
+				
+				let _ = message.edit(&ctx.http, new_message).await.unwrap();
+				return ();
+			}
+			let stock_resp = stock_resp.unwrap();
+
+
+            println!("{}", stock_resp.clone().file);
             // send image to discord
             let mut files: Vec<CreateAttachment> = vec![];
-            let file = File::open(image_path.clone()).await.unwrap();
+            let file = File::open(format!("./pics/{}", stock_resp.clone().file)).await.unwrap();
             files.push(CreateAttachment::file(&file, "test.png").await.unwrap());
 
-            let test = MessageBuilder::new()
-                .push("Here is the help image")
-                .push_bold_line("test bold")
-                .push_mono_line("test mono")
-                .build();
+			let temp_message = CreateMessage::new();
+			let _tchannel = ChannelId::new(167174376045805568 as u64);
+			let chan = _tchannel.send_files(&ctx.http, files, temp_message).await;
+	
+			let attachment_url = chan.unwrap().attachments[0].url.clone();
+
+			let mut description = MessageBuilder::new();
+
+	
+		
+			let chance_to_win = stock_resp.evaluation;
+
+			description.push_bold("Evaluation: ");
+			if chance_to_win > 0.0 {
+				description.push("You are winning by ");
+				description.push(format!("{:.2}%", chance_to_win));
+			} else if chance_to_win < -40.0 {
+				description.push("Consider Conceeding. You are losing by ");
+				description.push(format!("{:.2}%", chance_to_win));
+			} else if chance_to_win < 0.0 {
+				description.push("You are losing by ");
+				description.push(format!("{:.2}%", chance_to_win));
+			} else {
+				println!("You are equal.");
+			}
+			description.push("\n");
+			
+			description.push_bold("Forced Mate?: ");
+			if stock_resp.clone().mate.is_some() {
+				description.push(stock_resp.clone().mate.unwrap().to_string());
+				description.push("\n");
+			} else {
+				description.push("No");
+				description.push("\n");
+			}
+
+			description.push_bold("Best Move: ");
+			description.push(stock_resp.clone().bestmove.to_string());
+			description.push("\n");
+			
+                
+			let description = description.build();
+
+			let button = CreateButton::new("testButton")
+			.label("test")
+			.style(serenity::all::ButtonStyle::Primary)
+			.custom_id("testButton")
+			.disabled(false)
+			;
 
             let embed = CreateEmbed::default()
-                .title("Help")
-                .description("This is the help image")
-                .image("attachment://test.png")
-                .attachment("test.png");
+                .title(og_channel.to_uppercase())
+                .description(description)
+                .image(attachment_url);
 
-            let button = CreateButton::new("testButton")
-                .label("test")
-                .style(serenity::all::ButtonStyle::Primary)
-                .custom_id("testButton");
+       
 
-            let message = CreateMessage::new()
-                .content(test)
+            let message1 = EditMessage::new()
                 .embed(embed)
-                .button(button);
+				.button(button)
+				;
 
-            let ret = match msg.channel_id.send_files(&ctx.http, files, message).await {
-                Ok(msg) => {
-                    let id = msg.id;
-                    let _ = crate::models::message::Message::insert(crate::models::message::Message::new(
-						og_channel.to_string(),
-						id.to_string(),
-					));
-
-					()
-                }
-                Err(why) => println!("Error sending message: {why:?}"),
-            };
+			let _ = message.edit(&ctx.http, message1).await.unwrap();
 
             // clean up image
-            let _ = tokio::fs::remove_file(image_path).await;
-            ret
+            let _ = tokio::fs::remove_file(stock_resp.clone().file).await;
+            ()
         }
     }
 
     async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
         println!("Interaction received");
-        ctx.set_activity(Some(ActivityData::custom("Getting the cookie")));
+        // ctx.set_activity(Some(ActivityData::custom("Getting the cookie")));
 
         // update message it was called on
         let referenced_message = interaction.clone().message_component().unwrap().message.id;
-		// if referenced_message.is_none() {
-		// 	println!("No referenced message {:?}", interaction.clone().message_component().unwrap().message);
-		// 	return ();
-		// }
-
         let channel = crate::models::message::Message::find_by_channel_id(referenced_message.to_string());
 
 		if channel.is_err() {
+			println!("No referenced message {:?}", interaction.clone().message_component().unwrap().message);
+
 			println!("No channel found");
 			return ();
 		}
 
 		let channel = channel.unwrap();
+		let og_channel = channel.clone().lc_channel;
 		let channel = channel.lc_channel.as_str();
 
 		let channel = Arc::new(Mutex::new(&channel));
 
-        println!("{:?}", channel);
+        // send ping
+		let r = CreateInteractionResponse::Acknowledge;
+		let _ = interaction
+            .as_message_component()
+            .unwrap()
+            .create_response(&ctx.http, r)
+            .await;
 
-        let image_path = help(channel).await;
-        // println!("{}", image_path);
-        // // send image to discord	
+		
+
+		let mut description = MessageBuilder::new();
+
+		description.push_bold("Evaluation: ");
+		description.push_italic("Loading...");
+		description.push("\n");
+		
+		description.push_bold("Forced Mate?: ");
+		description.push_italic("Loading...");
+		description.push("\n");
+	
+		description.push_bold("Best Move: ");
+		description.push_italic("Loading...");
+		description.push("\n");
+		
+		let description = description.build();
+
+		let loading_embed = CreateEmbed::default()
+			.description(description)
+			.image("https://dummyimage.com/1024x1024/2b2d31/ffffff.png&text=Fetching+Stockfish...")
+			;
+
+		let loading_button = CreateButton::new("testButton")
+			.style(serenity::all::ButtonStyle::Primary)
+			.custom_id("testButton")
+			.disabled(true)
+			.label("Loading...")
+			;
+
+
+		let loading_message = EditMessage::new()
+			.embed(loading_embed)
+			.button(loading_button)
+
+			;
+
+		let _ = interaction.clone().message_component().unwrap().message.edit(&ctx.http, loading_message).await;
+ 
+
+
+
+
+        let stock_resp = help(channel).await;
+
+		if stock_resp.is_err() {
+			let nmessage = EditMessage::new().content("Error getting help");
+			let _ = interaction.clone().message_component().unwrap().message.edit(&ctx.http, nmessage).await;
+			return ();
+		}
+
+		let stock_resp = stock_resp.unwrap();
+
+	
+
 		let mut files: Vec<CreateAttachment> = vec![];
-        let file = File::open(image_path.clone()).await.unwrap();
-		files.push(CreateAttachment::file(&file, image_path.clone()).await.unwrap());
+        let file = File::open(format!("./pics/{}", stock_resp.clone().file)).await.unwrap();
+		files.push(CreateAttachment::file(&file, stock_resp.clone().file).await.unwrap());
+		
 
-        let test = MessageBuilder::new()
-        	.push("Here is the help image")
-        	.push_bold_line("test bold")
-        	.push_mono_line("test mono")
-        	.build();
+
+		let temp_message = CreateMessage::new();
+		let _tchannel = ChannelId::new(167174376045805568 as u64);
+		let chan = _tchannel.send_files(&ctx.http, files, temp_message).await;
+
+		let attachment_url = chan.unwrap().attachments[0].url.clone();
+
+
+
+		let mut description = MessageBuilder::new();
+
+		let chance_to_win = stock_resp.evaluation;
+
+		description.push_bold("Evaluation: ");
+		if chance_to_win > 0.0 {
+			description.push("You are winning by ");
+			description.push(format!("{:.2}%", chance_to_win));
+		} else if chance_to_win < -40.0 {
+			description.push("Consider Conceeding. You are losing by ");
+			description.push(format!("{:.2}%", chance_to_win));
+		} else if chance_to_win < 0.0 {
+			description.push("You are losing by ");
+			description.push(format!("{:.2}%", chance_to_win));
+		} else {
+			println!("You are equal.");
+		}
+			description.push("\n");
+			
+			description.push_bold("Forced Mate?: ");
+			if stock_resp.clone().mate.is_some() {
+				description.push(stock_resp.clone().mate.unwrap().to_string());
+				description.push("\n");
+			} else {
+				description.push("No");
+				description.push("\n");
+			}
+
+			description.push_bold("Best Move: ");
+			description.push(stock_resp.clone().bestmove.to_string());
+			description.push("\n");
+			
+                
+			let description = description.build();
 
         let embed = CreateEmbed::default()
-        	.title("Help")
-        	.description("This is the help imageaa")
-        	.image(format!("attachment://{}", image_path.clone()))
-        	.attachment(image_path.clone())
-			
-			
+			.title(og_channel.to_uppercase())
+			.description(description)
+        	.image(attachment_url)
+			// .attachment(image_path.clone())
+		
 			;
 
         let button = CreateButton::new("testButton")
-        	.label("test")
+        	.label("Refresh")
         	.style(serenity::all::ButtonStyle::Primary)
-        	.custom_id("testButton");
+        	.custom_id("testButton")
+			.disabled(false)
+		;
 
-		let edit_attachment = EditAttachments::new()
-			.add(CreateAttachment::file(&file, image_path.clone()).await.unwrap());
+	
 		let mut message = interaction.clone().message_component().unwrap().message;
 		
         let edit_message = EditMessage::new()
-		.content(test.clone())
 		.embed(embed.clone())
 		.remove_all_attachments()
-		// .attachments(edit_attachment)
+		.button(button)
 		;
-
-
-		let channel_id = ChannelId::new(u64::from(message.channel_id));
-
-		let builder = CreateMessage::new();
 
 
 
@@ -166,30 +374,12 @@ impl EventHandler for Handler {
             Ok(_) => (),
             Err(why) => println!("Error sending message: {why:?}"),
         }
-
-        // let r = CreateInteractionResponse::Pong;
-
-        // match interaction
-        //     .as_message_component()
-        //     .unwrap()
-        //     .create_response(&ctx.http, r)
-        //     .await
-        // {
-        //     Ok(_) => (),
-        //     Err(why) => println!("Error sending message: {why:?}"),
-        // }
-
-        // (&ctx.http, r).await {
-        // 	Ok(_) => (),
-        // 	Err(why) => println!("Error sending message: {why:?}")
-        // }
-
         ()
     }
 }
 
 #[hook]
-async fn ready(ctx: Context, _data_about_bot: serenity::model::gateway::Ready) {
+async fn ready(_: Context, _data_about_bot: serenity::model::gateway::Ready) {
     println!("Bot is ready.");
     println!("{}", _data_about_bot.user.name);
     // print invite link
