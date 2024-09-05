@@ -324,6 +324,8 @@ impl EventHandler for Handler {
 			description.push("You are losing by ");
 			description.push(format!("{:.2}%", chance_to_win));
 		} else {
+			description.push("equal");
+
 			println!("You are equal.");
 		}
 			description.push("\n");

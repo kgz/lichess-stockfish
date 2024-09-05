@@ -100,6 +100,9 @@ pub async fn parse_html<'a>(
 ) -> Result<([[u8; 8]; 8], &'a str, Vec<(f32, f32)>), Error> {
     let url = url.lock().await;
     let url = url.to_string();
+
+	let channel = channel.lock().await;
+	let channel = channel.to_string();
     let mut board = [[0u8; 8]; 8];
     // set board at 3, 5 to 1
     let html = get_html(url).await?;
@@ -136,14 +139,14 @@ pub async fn parse_html<'a>(
 
 
     // let orientation_w = dom.get_elements_by_class_name("orientation-black").next();
-    let classes = orientation_b
-        .get(dom.parser())
-        .unwrap()
-        .as_tag()
-        .unwrap()
-        .attributes()
-        .class()
-        .unwrap();
+    // let classes = orientation_b
+    //     .get(dom.parser())
+    //     .unwrap()
+    //     .as_tag()
+    //     .unwrap()
+    //     .attributes()
+    //     .class()
+    //     .unwrap();
 
     // there should be 2
     let last_moves = dom.get_elements_by_class_name("last-move");
@@ -179,6 +182,28 @@ pub async fn parse_html<'a>(
         last_moves_x_y_vec.push((x, y));
     }
 
+	let a = dom.get_elements_by_class_name("player");
+
+	let mut classes = None;
+	for i in a {
+		// if child a haas href of '/@/{channel}' then we are player
+		let child = i.get(dom.parser()).unwrap().as_tag().unwrap().children().all(dom.parser()).first().unwrap();
+		let href = child.as_tag().unwrap().attributes().get("href").unwrap().unwrap();
+		let href = str::from_utf8(href.as_bytes()).unwrap();
+		if href.to_lowercase().contains(channel.to_lowercase().as_str()) {
+			println!("Player found at index: {:?}", i);
+			classes = Some(i.get(dom.parser()).unwrap().as_tag().unwrap().attributes().class().unwrap());
+			break;
+		}
+	}
+
+	if !classes.is_some() {
+		return Err(Error::BasicError("Classes not found".to_string()));
+	}
+
+	let classes = classes.unwrap();
+
+	// bug here, player is not alwyas the first in the list.
 	let nclasses = classes.as_utf8_str();
 	let nclasses = nclasses.split_whitespace().collect::<Vec<&str>>();
 	println!("classess: {:?}", nclasses.clone());
@@ -360,15 +385,17 @@ pub async fn help<'a>(channel: Arc<Mutex<&'a &str>>) -> Result<GetStockFishRespo
 		None => 0.0,
 	};
 	let mut chance_to_win;
-	if (stockfish.evaluation.is_some()) {
+	if stockfish.evaluation.is_some() {
 		chance_to_win = (stockfish.evaluation.unwrap()) / 153.0;
 		if mode == "b" {
 			chance_to_win = 1.0 - chance_to_win;
 		}
-		chance_to_win = (chance_to_win * 100.0) - 100.0;
+		chance_to_win = chance_to_win * 100.0;
 	} else {
 		chance_to_win = 0.0;
 	}
+
+	println!("chance to win: {:?}", chance_to_win);
 
     println!("Best Move: {:?}", bestmove);
     println!("Ponder: {:?}", ponder);
@@ -517,10 +544,12 @@ pub fn gen_board(
     let mut y = best_move[1] as u8 - 49;
 
     // if mode is 'b' then we need to revese the x
-    if mode == "w" {
+    if mode == "b" {
         x = 7 - x;
-        y = 7 - y;
-    }
+        // y = 7 - y;
+    }  else {
+		y = 7 - y;
+	}
 
     let x = x as usize;
     let y = y as usize;
@@ -550,10 +579,12 @@ pub fn gen_board(
     let mut y = best_move[3] as u8 - 49;
 
     // if mode is 'b' then we need to revese the x
-    if mode == "w" {
+    if mode == "b" {
         x = 7 - x;
-        y = 7 - y;
-    }
+        // y = 7 - y;
+    } else {
+		y = 7 - y;
+	}
 
     let x = x as usize;
     let y = y as usize;
